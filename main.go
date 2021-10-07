@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"sync"
 	"syscall"
 
@@ -19,7 +20,9 @@ import (
 )
 
 var (
-	daemon    = flag.Bool("daemon", false, "run daemon process")
+	daemon    = flag.Bool("D", false, "run daemon in foreground")
+	bind      = flag.String("a", "/tmp/ssh-agent.sock", "bind path for unix socket")
+	kill      = flag.Bool("k", false, "kill currently running ssh-agent process based on SSH_AGENT_PID")
 	nofile    = flag.Int("nofile", 10000, "desired NOFILE limit, if too high the max is taken")
 	errLocked = errors.New("agent: locked")
 )
@@ -146,6 +149,31 @@ func (p *parallelSigningAgent) Extension(extensionType string, contents []byte) 
 
 func main() {
 	flag.Parse()
+
+	if *kill {
+		val, ok := os.LookupEnv("SSH_AGENT_PID")
+		if !ok {
+			panic("SSH_AGENT_PID is not set")
+		}
+
+		pid, err := strconv.Atoi(val)
+		if err != nil {
+			panic(fmt.Errorf("provided pid '%s' is not an integer: %v", val, err))
+		}
+
+		p, err := os.FindProcess(pid)
+		if err != nil {
+			panic(fmt.Errorf("could not find process with pid '%d': %v", pid, err))
+		}
+
+		err = p.Signal(os.Kill)
+		if err != nil {
+			panic(fmt.Errorf("SIGKILL failed: %v", err))
+		}
+
+		return
+	}
+
 	if !*daemon {
 		launchDaemon()
 		return
@@ -171,14 +199,14 @@ func main() {
 		fmt.Printf("raised nofile limit to %d\n", rLimit.Cur)
 	}
 
-	if _, err = os.Stat("/tmp/ssh-agent.sock"); err == nil {
-		err = os.Remove("/tmp/ssh-agent.sock")
+	if _, err = os.Stat(*bind); err == nil {
+		err = os.Remove(*bind)
 		if err != nil {
 			panic(err)
 		}
 	}
 
-	addr, err := net.ResolveUnixAddr("unix", "/tmp/ssh-agent.sock")
+	addr, err := net.ResolveUnixAddr("unix", *bind)
 	if err != nil {
 		panic(err)
 	}
@@ -221,16 +249,20 @@ func launchDaemon() {
 		panic(err)
 	}
 
-	args := append(os.Args, "--daemon")
+	args := append(os.Args, "-D")
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Dir = cwd
 	err = cmd.Start()
 	if err != nil {
 		panic(err)
 	}
+	pid := cmd.Process.Pid
 
 	err = cmd.Process.Release()
 	if err != nil {
 		panic(err)
 	}
+
+	fmt.Printf("export SSH_AUTH_SOCK=%s\n", *bind)
+	fmt.Printf("export SSH_AGENT_PID=%d\n", pid)
 }
