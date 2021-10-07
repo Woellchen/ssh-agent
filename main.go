@@ -152,6 +152,7 @@ func main() {
 		panic(err)
 	}
 
+	oldCur := rLimit.Cur
 	rLimit.Cur = uint64(math.Min(float64(*nofile), float64(rLimit.Max)))
 	err = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
 	if err != nil {
@@ -160,10 +161,10 @@ func main() {
 
 	err = syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit)
 	if err != nil {
-		panic(err)
+		fmt.Printf("failed setting NOFILE limit to %d, left at %d: %v\n", rLimit.Cur, oldCur, err)
+	} else {
+		fmt.Printf("raised nofile limit to %d\n", rLimit.Cur)
 	}
-
-	fmt.Printf("raised nofile limit to %d\n", rLimit.Cur)
 
 	if _, err = os.Stat("/tmp/ssh-agent.sock"); err == nil {
 		err = os.Remove("/tmp/ssh-agent.sock")
@@ -181,18 +182,23 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-
-	kr := &parallelSigningAgent{agent: agent.NewKeyring().(agent.ExtendedAgent)}
-
+	defer func() {
+		if err := l.Close(); err != nil {
+			fmt.Printf("closing listener failed: %v\n", err)
+		}
+	}()
 	fmt.Println("accepting clients..")
+
+	keyring := &parallelSigningAgent{agent: agent.NewKeyring().(agent.ExtendedAgent)}
 	for {
 		conn, err := l.Accept()
 		if err != nil {
-			panic(err)
+			fmt.Printf("accepting client failed: %v\n", err)
+			continue
 		}
 
 		go func(conn net.Conn) {
-			err := agent.ServeAgent(kr, conn)
+			err := agent.ServeAgent(keyring, conn)
 			_ = conn.Close()
 
 			if err != nil && err != io.EOF {
