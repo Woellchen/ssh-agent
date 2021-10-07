@@ -191,14 +191,14 @@ func main() {
 			panic(err)
 		}
 
-		go func() {
+		go func(conn net.Conn) {
 			err := agent.ServeAgent(kr, conn)
 			_ = conn.Close()
 
 			if err != nil && err != io.EOF {
 				fmt.Printf("serving failed: %v\n", err)
 			}
-		}()
+		}(conn)
 	}
 }
 
