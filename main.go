@@ -111,27 +111,32 @@ func (p *parallelSigningAgent) SignWithFlags(key ssh.PublicKey, data []byte, fla
 
 	wanted := key.Marshal()
 	for _, s := range signers {
-		if bytes.Equal(s.PublicKey().Marshal(), wanted) {
-			if flags == 0 {
-				return s.Sign(rand.Reader, data)
-			} else {
-				if algorithmSigner, ok := s.(ssh.AlgorithmSigner); !ok {
-					return nil, fmt.Errorf("agent: signature does not support non-default signature algorithm: %T", s)
-				} else {
-					var algorithm string
-					switch flags {
-					case agent.SignatureFlagRsaSha256:
-						algorithm = ssh.SigAlgoRSASHA2256
-					case agent.SignatureFlagRsaSha512:
-						algorithm = ssh.SigAlgoRSASHA2512
-					default:
-						return nil, fmt.Errorf("agent: unsupported signature flags: %d", flags)
-					}
-					return algorithmSigner.SignWithAlgorithm(rand.Reader, data, algorithm)
-				}
-			}
+		if !bytes.Equal(s.PublicKey().Marshal(), wanted) {
+			continue
 		}
+
+		if flags == 0 {
+			return s.Sign(rand.Reader, data)
+		}
+
+		algorithmSigner, ok := s.(ssh.AlgorithmSigner)
+		if !ok {
+			return nil, fmt.Errorf("agent: signature does not support non-default signature algorithm: %T", s)
+		}
+
+		var algorithm string
+		switch flags {
+		case agent.SignatureFlagRsaSha256:
+			algorithm = ssh.SigAlgoRSASHA2256
+		case agent.SignatureFlagRsaSha512:
+			algorithm = ssh.SigAlgoRSASHA2512
+		default:
+			return nil, fmt.Errorf("agent: unsupported signature flags: %d", flags)
+		}
+
+		return algorithmSigner.SignWithAlgorithm(rand.Reader, data, algorithm)
 	}
+
 	return nil, errors.New("not found")
 }
 
@@ -197,14 +202,16 @@ func main() {
 			continue
 		}
 
-		go func(conn net.Conn) {
-			err := agent.ServeAgent(keyring, conn)
-			_ = conn.Close()
+		go handleClient(keyring, conn)
+	}
+}
 
-			if err != nil && err != io.EOF {
-				fmt.Printf("serving failed: %v\n", err)
-			}
-		}(conn)
+func handleClient(keyring *parallelSigningAgent, conn net.Conn) {
+	err := agent.ServeAgent(keyring, conn)
+	_ = conn.Close()
+
+	if err != nil && err != io.EOF {
+		fmt.Printf("serving failed: %v\n", err)
 	}
 }
 
