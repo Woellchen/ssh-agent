@@ -1,29 +1,19 @@
-package main
+package sshagent
 
 import (
 	"bytes"
 	"crypto/rand"
 	"errors"
-	"flag"
 	"fmt"
-	"io"
-	"math"
-	"net"
-	"os"
 	"os/exec"
-	"strconv"
 	"sync"
-	"syscall"
 
+	"github.com/gopasspw/pinentry"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
 
 var (
-	daemon    = flag.Bool("D", false, "run daemon in foreground")
-	bind      = flag.String("a", "/tmp/ssh-agent.sock", "bind path for unix socket")
-	kill      = flag.Bool("k", false, "kill currently running ssh-agent process based on SSH_AGENT_PID")
-	nofile    = flag.Int("nofile", 10000, "desired NOFILE limit, if too high the max is taken")
 	errLocked = errors.New("agent: locked")
 )
 
@@ -147,122 +137,28 @@ func (p *parallelSigningAgent) Extension(extensionType string, contents []byte) 
 	return p.agent.Extension(extensionType, contents)
 }
 
-func main() {
-	flag.Parse()
-
-	if *kill {
-		val, ok := os.LookupEnv("SSH_AGENT_PID")
-		if !ok {
-			panic("SSH_AGENT_PID is not set")
-		}
-
-		pid, err := strconv.Atoi(val)
-		if err != nil {
-			panic(fmt.Errorf("provided pid '%s' is not an integer: %v", val, err))
-		}
-
-		p, err := os.FindProcess(pid)
-		if err != nil {
-			panic(fmt.Errorf("could not find process with pid '%d': %v", pid, err))
-		}
-
-		err = p.Signal(os.Kill)
-		if err != nil {
-			panic(fmt.Errorf("SIGKILL failed: %v", err))
-		}
-
-		return
+func getPIN(serial uint32, retries int) (string, error) {
+	bin := pinentry.GetBinary()
+	if _, err := exec.LookPath(bin); err != nil {
+		panic(fmt.Errorf("could not find %s: %w", bin, err))
 	}
 
-	if !*daemon {
-		launchDaemon()
-		return
-	}
-
-	var rLimit syscall.Rlimit
-	err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit)
+	p, err := pinentry.New()
 	if err != nil {
-		panic(err)
+		return "", fmt.Errorf("failed to start %q: %w", pinentry.GetBinary(), err)
 	}
+	defer p.Close()
+	p.Set("title", "yubikey-agent PIN Prompt")
+	p.Set("desc", fmt.Sprintf("YubiKey serial number: %d (%d tries remaining)", serial, retries))
+	p.Set("prompt", "Please enter your PIN:")
 
-	oldCur := rLimit.Cur
-	rLimit.Cur = uint64(math.Min(float64(*nofile), float64(rLimit.Max)))
-	err = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
-	if err != nil {
-		panic(err)
-	}
+	// Enable opt-in external PIN caching (in the OS keychain).
+	// https://gist.github.com/mdeguzis/05d1f284f931223624834788da045c65#file-info-pinentry-L324
+	p.Option("allow-external-password-cache")
+	p.Set("KEYINFO", fmt.Sprintf("--yubikey-id-%d", serial))
 
-	err = syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit)
-	if err != nil {
-		fmt.Printf("failed setting NOFILE limit to %d, left at %d: %v\n", rLimit.Cur, oldCur, err)
-	} else {
-		fmt.Printf("raised nofile limit to %d\n", rLimit.Cur)
-	}
+	pinentry.Unescape = true
+	pin, err := p.GetPin()
 
-	if _, err = os.Stat(*bind); err == nil {
-		err = os.Remove(*bind)
-		if err != nil {
-			panic(err)
-		}
-	}
-
-	addr, err := net.ResolveUnixAddr("unix", *bind)
-	if err != nil {
-		panic(err)
-	}
-
-	l, err := net.ListenUnix("unix", addr)
-	if err != nil {
-		panic(err)
-	}
-	defer func() {
-		if err := l.Close(); err != nil {
-			fmt.Printf("closing listener failed: %v\n", err)
-		}
-	}()
-	fmt.Println("accepting clients..")
-
-	keyring := &parallelSigningAgent{agent: agent.NewKeyring().(agent.ExtendedAgent)}
-	for {
-		conn, err := l.Accept()
-		if err != nil {
-			fmt.Printf("accepting client failed: %v\n", err)
-			continue
-		}
-
-		go handleClient(keyring, conn)
-	}
-}
-
-func handleClient(keyring *parallelSigningAgent, conn net.Conn) {
-	err := agent.ServeAgent(keyring, conn)
-	_ = conn.Close()
-
-	if err != nil && err != io.EOF {
-		fmt.Printf("serving failed: %v\n", err)
-	}
-}
-
-func launchDaemon() {
-	cwd, err := os.Getwd()
-	if err != nil {
-		panic(err)
-	}
-
-	args := append(os.Args, "-D")
-	cmd := exec.Command(args[0], args[1:]...)
-	cmd.Dir = cwd
-	err = cmd.Start()
-	if err != nil {
-		panic(err)
-	}
-	pid := cmd.Process.Pid
-
-	err = cmd.Process.Release()
-	if err != nil {
-		panic(err)
-	}
-
-	fmt.Printf("export SSH_AUTH_SOCK=%s\n", *bind)
-	fmt.Printf("export SSH_AGENT_PID=%d\n", pid)
+	return string(pin), err
 }
